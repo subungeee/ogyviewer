@@ -1,0 +1,62 @@
+name: Publish viewer
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Download and verify runtime release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib,io,json,os,pathlib,stat,urllib.request,zipfile
+          repo=os.environ['GITHUB_REPOSITORY']
+          req=urllib.request.Request('https://api.github.com/repos/'+repo+'/releases/latest',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
+          with urllib.request.urlopen(req) as r: release=json.load(r)
+          assets=[a for a in release['assets'] if a['name']=='ogyviewer-web.zip']
+          assert len(assets)==1,'Missing runtime archive'
+          asset=assets[0]
+          assert asset['browser_download_url'].startswith('https://github.com/'+repo+'/releases/download/')
+          with urllib.request.urlopen(asset['browser_download_url']) as r: data=r.read()
+          if asset.get('digest'): assert asset['digest']=='sha256:'+hashlib.sha256(data).hexdigest()
+          z=zipfile.ZipFile(io.BytesIO(data))
+          assert sum(i.file_size for i in z.infolist())<1_000_000_000
+          names=z.namelist();assert len(names)==len(set(names))
+          pins=json.loads(z.read('site-pins.json'))['files']
+          assert set(names)==set(pins)|{'site-pins.json'}
+          out=pathlib.Path('site');out.mkdir()
+          for name,pin in pins.items():
+              assert not name.startswith('/') and '\\' not in name and ':' not in name and '..' not in name.split('/')
+              info=z.getinfo(name);assert not stat.S_ISLNK(info.external_attr>>16)
+              b=z.read(name);assert len(b)==pin['bytes'] and hashlib.sha256(b).hexdigest()==pin['sha256']
+              target=out/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(b)
+          assert (out/'index.html').is_file() and (out/'latest.json').is_file()
+          print('Verified',len(pins),'runtime files')
+          PY
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
